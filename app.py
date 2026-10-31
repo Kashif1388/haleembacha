@@ -9,6 +9,7 @@ Upload a resume (PDF / DOCX / TXT) and get:
 UI: Streamlit  |  AI: Groq API
 """
 
+import hashlib
 import io
 import json
 import os
@@ -24,13 +25,19 @@ from pypdf import PdfReader
 # --------------------------------------------------------------------------- #
 APP_TITLE = "ATS Resume Analyzer"
 
-# Check https://console.groq.com/docs/models for the current model list.
+# Preferred models, best first. Groq's catalog changes often (and some models are
+# enterprise-only), so at runtime the app asks Groq which of these your key can
+# actually use and hides the rest. See https://console.groq.com/docs/models
 MODELS = {
-    "Llama 3.3 70B (best quality)": "llama-3.3-70b-versatile",
-    "Llama 3.1 8B (fastest)": "llama-3.1-8b-instant",
+    "GPT-OSS 120B (best quality)": "openai/gpt-oss-120b",
+    "GPT-OSS 20B (fastest)": "openai/gpt-oss-20b",
+    "Llama 3.3 70B": "llama-3.3-70b-versatile",
+    "Llama 3.1 8B": "llama-3.1-8b-instant",
 }
+# Substrings that mark non-chat models (speech, safety classifiers, agent systems...).
+NON_CHAT_HINTS = ("whisper", "orpheus", "guard", "safeguard", "compound", "tts", "embed")
 
-MAX_RESUME_CHARS = 12000      # keeps the prompt well inside Groq token limits
+MAX_RESUME_CHARS = 10000      # keeps the prompt well inside Groq token limits
 MIN_RESUME_CHARS = 100        # below this we assume the PDF is a scanned image
 MAX_UPLOAD_MB = 5
 
@@ -298,6 +305,21 @@ def build_user_prompt(resume_text: str, job_description: str, checks: dict) -> s
     return "\n".join(parts)
 
 
+def get_model_options(client) -> dict:
+    """Return {label: model_id} for chat models this API key can use (falls back to MODELS)."""
+    try:
+        ids = [m.id for m in client.models.list().data]
+    except Exception:  # bad key, offline, SDK change... the app still works with the defaults
+        return dict(MODELS)
+    chat_ids = [i for i in ids if not any(h in i.lower() for h in NON_CHAT_HINTS)]
+    curated = {label: mid for label, mid in MODELS.items() if mid in chat_ids}
+    if curated:
+        return curated
+    if chat_ids:
+        return {i: i for i in sorted(chat_ids)}
+    return dict(MODELS)
+
+
 def analyze_resume(client, model: str, resume_text: str, job_description: str = "") -> dict:
     """Call Groq and return a validated result dict. Retries once on bad JSON."""
     checks = quick_checks(resume_text)
@@ -309,13 +331,16 @@ def analyze_resume(client, model: str, resume_text: str, job_description: str = 
     use_json_mode = True
     last_error = None
     for _ in range(3):
-        kwargs = dict(model=model, messages=messages, temperature=0.2, max_tokens=3000)
+        # max_tokens is generous because reasoning models (GPT-OSS) spend tokens "thinking" first.
+        kwargs = dict(model=model, messages=messages, temperature=0.2, max_tokens=4096)
         if use_json_mode:
             kwargs["response_format"] = {"type": "json_object"}
+            if "gpt-oss" in model:  # keep reasoning short: faster and fewer tokens used
+                kwargs["extra_body"] = {"reasoning_effort": "low"}
         try:
             response = client.chat.completions.create(**kwargs)
         except Exception as exc:
-            # Some models reject JSON mode with HTTP 400 - retry once without it.
+            # Some models reject these options with HTTP 400 - retry once without them.
             if use_json_mode and getattr(exc, "status_code", None) == 400:
                 use_json_mode = False
                 last_error = exc
@@ -341,8 +366,12 @@ def friendly_error(exc: Exception) -> str:
         return "Your Groq API key was rejected. Please check it and try again."
     if status == 429 or "RateLimit" in name:
         return "Groq rate limit reached. Wait a minute and try again, or choose the faster model."
+    if status == 404 or "NotFound" in name:
+        return ("This model isn't available to your Groq account. Pick a different model in the sidebar "
+                "(see console.groq.com/docs/models).")
     if status == 413:
-        return "The resume is too large for this model. Try a shorter resume."
+        return ("The request is too large for your plan's per-minute token limit. "
+                "Try the 20B model or a shorter resume.")
     if "Connection" in name or "Timeout" in name:
         return "Could not reach Groq. Check your internet connection and try again."
     if isinstance(exc, ValueError):
@@ -408,6 +437,19 @@ def get_api_key() -> str:
             help="Get a free key at console.groq.com/keys. It is only used for this session.",
         )
     return (key or "").strip()
+
+
+def load_model_options(client, api_key: str) -> dict:
+    """Model list for the dropdown, looked up once per API key per session."""
+    if not client:
+        return dict(MODELS)
+    fingerprint = hashlib.sha256(api_key.encode()).hexdigest()
+    cached = st.session_state.get("model_cache")
+    if cached and cached[0] == fingerprint:
+        return cached[1]
+    options = get_model_options(client)
+    st.session_state["model_cache"] = (fingerprint, options)
+    return options
 
 
 def render_results(result: dict, filename: str) -> None:
@@ -502,10 +544,12 @@ def main() -> None:
     st.caption("Upload your resume to get an estimated ATS score and concrete ways to improve it.")
 
     api_key = get_api_key()
+    client = Groq(api_key=api_key) if api_key else None
+    options = load_model_options(client, api_key)
     with st.sidebar:
-        model_label = st.selectbox("AI model", list(MODELS.keys()))
+        model_label = st.selectbox("AI model", list(options.keys()))
         st.caption("Your resume is sent to Groq for analysis and is not stored by this app.")
-    model = MODELS[model_label]
+    model = options[model_label]
 
     uploaded = st.file_uploader("Upload resume", type=["pdf", "docx", "txt"])
     job_description = st.text_area(
@@ -526,7 +570,7 @@ def main() -> None:
                 with st.spinner("Reading your resume..."):
                     text = extract_text(uploaded.name, uploaded.getvalue())
                 with st.spinner("Analysing with Groq - this takes a few seconds..."):
-                    result = analyze_resume(Groq(api_key=api_key), model, text, job_description)
+                    result = analyze_resume(client, model, text, job_description)
                 st.session_state["result"] = result
                 st.session_state["filename"] = uploaded.name
             except Exception as exc:
