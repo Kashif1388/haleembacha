@@ -73,14 +73,15 @@ ats-resume-analyzer/
 | Problem | Fix |
 |---|---|
 | "API key was rejected" | Re-copy the key from the Groq console; make sure there are no extra spaces or quotes. |
-| "Rate limit reached" | Wait a minute, or switch to the faster 8B model in the sidebar. |
+| "Rate limit reached" | Wait a minute, or switch to the faster GPT-OSS 20B model in the sidebar. |
 | "Almost no text could be extracted" | The PDF is probably a scanned image. Export a text-based PDF or DOCX. |
-| Model not found error | Models change over time. Update the `MODELS` dictionary in `app.py` using <https://console.groq.com/docs/models>. |
+| "Model isn't available to your account" (404) | Some models (e.g. Llama 3.x) are enterprise-only. The app lists only models your key can use; pick another in the sidebar. |
+| Request too large (413) | Your plan's per-minute token limit was hit. Use GPT-OSS 20B or a shorter resume. |
 | Build fails on Streamlit Cloud | Confirm `requirements.txt` is in the repo root and the file names are spelled correctly. |
 
 ## Customising
 
-- **Models:** edit the `MODELS` dictionary at the top of `app.py`.
+- **Models:** the sidebar lists the chat models your Groq key can use (looked up live from Groq). To change the preferred order or add models, edit the `MODELS` dictionary at the top of `app.py`; see <https://console.groq.com/docs/models>.
 - **Scoring weights:** edit `WEIGHTS` (the overall score is computed in Python from the category scores).
 - **Review criteria:** edit `SYSTEM_PROMPT`.
 
